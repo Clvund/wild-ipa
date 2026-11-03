@@ -1,0 +1,91 @@
+name: Build wild iOS IPA (patched, CF-search fix)
+
+# 用法：把这个文件放到你自己仓库的 .github/workflows/ 下，然后在 Actions 页面手动 Run workflow。
+# 产出：wild-ios-patched-nosign.ipa（未签名，用 Sideloadly / zsign 签后安装）
+#
+# 它做的事：克隆上游 niuhuan/wild → 打一个补丁 → flutter build ios --no-codesign → 打包成 ipa
+# 补丁内容：搜索请求里 `&charset=gbk` 改成 `&%63harset=gbk`
+#   （文库8 的 Cloudflare WAF 规则匹配到小写 "charset" 就 403；把参数名百分号编码后
+#    WAF 不再命中，而 PHP 解码后仍然是 charset=gbk，返回内容不变）
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '上游分支/标签/commit'
+        required: true
+        default: 'main'
+      keep_original:
+        description: '只构建不补丁（对照用）'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Clone upstream
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.ref }}" https://github.com/niuhuan/wild.git work
+          cd work
+          echo "HEAD: $(git log -1 --format='%h %s')"
+
+      - name: Patch search URL
+        if: ${{ !inputs.keep_original }}
+        working-directory: work
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("rust/src/wenku8/client.rs")
+          s = p.read_text(encoding="utf-8")
+          old = "/modules/article/search.php?searchtype={search_type}&searchkey={search_key}&page={page}&charset=gbk"
+          new = "/modules/article/search.php?searchtype={search_type}&searchkey={search_key}&page={page}&%63harset=gbk"
+          n = s.count(old)
+          if n != 1:
+              sys.exit(f"expected exactly 1 match, got {n} — upstream changed, patch aborted")
+          p.write_text(s.replace(old, new), encoding="utf-8")
+          print("patched ok")
+          PY
+          grep -n '%63harset' rust/src/wenku8/client.rs
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: 'master'
+          cache: true
+
+      - name: Resolve dependencies
+        working-directory: work
+        run: flutter pub get
+
+      - name: Build iOS (no codesign)
+        working-directory: work
+        run: flutter build ios --release --no-codesign
+
+      - name: Package IPA
+        working-directory: work
+        run: |
+          set -euo pipefail
+          VERSION=$(awk '/^version:/{print $2}' pubspec.yaml | cut -d+ -f1 | tr -d '\r')
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          rm -rf Payload/Runner.app/_CodeSignature Payload/Runner.app/embedded.mobileprovision || true
+          zip -qry "wild-${VERSION}-ios-patched-nosign.ipa" Payload
+          rm -rf Payload
+          ls -lh ./*.ipa
+          shasum -a 256 ./*.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: wild-ios-ipa
+          path: work/*.ipa
+          retention-days: 14
